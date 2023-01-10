@@ -1,0 +1,473 @@
+---
+title: "Data Cleaning for per-pathogen virulence project"
+author: "Judith Bouman"
+date: "2023-01-09"
+output: pdf_document
+---
+```{r setup, include=FALSE}
+# Load neccasery libraries
+
+library(lmerTest)
+library(psych)
+library(ggplot2)
+library(grDevices)
+library(lme4)
+library(optimx)
+library(scatterplot3d) 
+library(qpcR)
+library(chngpt)
+library(bbmle)
+library(lme4)
+library(matlib)
+library(numDeriv)
+
+# put settings to enghlish, to get the correct dates afterwards.
+Sys.setlocale("LC_TIME", "English")
+
+# Set directory
+setwd("/Users/jb22m516/Documents/GitHub/ppv")
+
+```
+
+## Read in data
+
+This document contains all code to reproduce the analysis described in the manuscript.  
+The first step is to read all data. 
+
+```{r read in data, echo = F}
+# Read in data files
+VL_data = read.csv('vl.csv',header = TRUE, blank.lines.skip = TRUE) # viral load data
+CD4_data = read.csv('cd4prof_NEW.csv',header = TRUE, blank.lines.skip = TRUE) # CD4 data --> do I even need these?
+data = read.csv('data_perparacite_copy.csv',header = TRUE, blank.lines.skip = TRUE) # original datafile with data combined
+arv = read.csv('arv.csv',header = TRUE, blank.lines.skip = TRUE) # data on treatments used
+
+attach(data)
+
+# treat data such that it can be used
+
+# Remove d from time measure and convert to integer
+data$Time..Days. = as.integer(gsub( "d", "", as.character(data$Time..Days.)))
+
+# Remove empty rows
+data = data[!is.na(data$Patient.ID),]
+
+# fix names of columns
+names(VL_data) <- c('PTID', names(VL_data)[2:11])
+names(CD4_data) <- c('PTID', names(CD4_data)[2:5]) 
+names(data) <- c('Patient.ID', names(data)[2:27])
+
+# Determine which IDs to use in the analysis (firs instance use only from the original analysis) CHANGE LATER
+IDs_VL = sort(unique(VL_data$PTID))
+IDs_CD4 = sort(unique(CD4_data$PTID)) 
+IDs_data = sort(unique(data$Patient.ID))
+IDs = unique(c(IDs_CD4,IDs_data,IDs_VL))
+```
+
+## Methods
+
+# Inclusion criteria 
+
+The next part of the code creates a list of all viral load measures and CD4 counts per individual that were collected after the primary infection. 
+The duration of the primary infection is set to be 90 days. 
+The code also creates a list of the subtypes, ages and country of origin for all participants. 
+
+Moreover, it checks for each participant whether the data fulfills the requirements of inclusion: 
+1) at least 4 CD4 measurements, 
+2) at least 3 viral load measurments, 
+3) measurements of CD4 count are at least 180 days apart, 
+4) the subtype of the individual is known. 
+
+```{r filter data, echo=FALSE}
+#######################################################################
+################# Make per patient list of all VL and CD4 #############
+#######################################################################
+
+# initialize vectors
+per_patient_VL <- rep( list(0), length(IDs))        # all VL data per patient
+per_patient_CD4 <- rep( list(0), length(IDs))       # all CD4 data per patient
+
+subtypes =  vector(mode = "character", length(IDs)) # patient subtype
+country = vector(mode = "character", length(IDs))   # Country
+age = vector(mode = "numeric", length(IDs))         # age of patient
+ART1DT = vector(mode = "numeric", length(IDs))      # start of ART treatment if appicable
+suitable = rep(FALSE, length(IDs))                  # vector indicating if enough data is available for each patient
+
+# Do you want to have a general primary infection period (1) or a subtype specific (2)? In the final manuscript we decided to not report on option 2 due to data restrictions. 
+primary = 1
+
+i = 1
+
+for (j in IDs){
+
+  tot = data[data$Patient.ID==j,]
+
+  per_patient_VL[[i]] = VL_data[VL_data$PTID==j,c(2,3,4)]
+  per_patient_CD4[[i]] = CD4_data[CD4_data$PTID==j,c(2,3,4)]
+
+  #print(per_patient_VL[[i]])
+  #print(per_patient_CD4[[i]])
+
+  # Remove CD4 counts without a date
+  per_patient_CD4[[i]] = per_patient_CD4[[i]][!per_patient_CD4[[i]]$VISDATE=="",]
+
+  per_patient_VL[[i]]$GCLPLAMA[per_patient_VL[[i]]$GCLPLAMA==0] <- 50 # set to detection limit
+
+  # remove NA values for counts
+  per_patient_VL[[i]] = per_patient_VL[[i]][!is.na(per_patient_VL[[i]]$GCLPLAMA),]
+  per_patient_CD4[[i]] = per_patient_CD4[[i]][!is.na(per_patient_CD4[[i]]$CD4),]
+
+  # make number of days instead of visit number using the dates
+  date_VL = as.Date(per_patient_VL[[i]][,2],format='%d.%m.%y')
+  date_CD4 = as.Date(per_patient_CD4[[i]][,2],format='%d.%b.%y')
+
+  #determine date of first measurement
+  first_date = min(date_CD4, date_VL)
+
+  # add number of days to data
+  days_VL = as.numeric(date_VL-first_date)
+  per_patient_VL[[i]]$Days <- days_VL
+  days_CD4 = as.numeric(date_CD4-first_date)
+  per_patient_CD4[[i]]$Days <- days_CD4
+
+  # Determine age, country and subtype
+  age[i] = CD4_data[CD4_data$PTID==j,5][1]
+  country[i] = as.character(tot$Source[1])
+  subtypes[i] = as.character(tot$Patient.Subtype[1]) # can this be improved?
+
+  # in case first subtype has no value, try second one
+  if (length(subtypes[i])>0){
+    if (!is.na(subtypes[i])){
+      if (subtypes[i]==""){
+        subtypes[i] = as.character(tot$Patient.Subtype[2])
+      }
+    }
+  }
+
+  # get initial date of treatment initiation, when symptoms where observed
+  treatment = floor(arv[arv$PTID==j,]$ART1VIS)
+
+  if (length(treatment)>0){
+    ART1DT[i] <- as.numeric(treatment[1])
+  } else {
+    ART1DT[i] <- NA
+  }
+
+  low_CD4_tr = 100 # to make sure it has a value even if it did not happen
+
+  # Also remove patients that score two concecutive times lower than 200
+  low.counts = per_patient_CD4[[i]][per_patient_CD4[[i]]$CD4<200,]
+
+  if (dim(low.counts)[1]>1){
+    for (k in seq(1,dim(low.counts)[1]-1,1)){
+      if ((as.integer(row.names(low.counts))[k]-as.integer(row.names(low.counts))[k+1])==-1){
+        low_CD4_tr = low.counts$VISIT[k+1]
+        per_patient_CD4[[i]] = per_patient_CD4[[i]][per_patient_CD4[[i]]$VISIT<=low_CD4_tr,]
+      }
+    }
+  }
+
+  # Remove data after smallest visit number of both treatment start possibilities
+  min_treatment <- min(ART1DT[i],low_CD4_tr,na.rm = TRUE)
+
+  per_patient_CD4[[i]]=per_patient_CD4[[i]][per_patient_CD4[[i]]$VISIT<=min_treatment,]
+  per_patient_VL[[i]]=per_patient_VL[[i]][per_patient_VL[[i]]$VISIT<=min_treatment,]
+
+  # Filter VL data
+  # remove points obtained during primary infection (time differs per subtype)
+  if (primary == 1){
+    t_primary = 90
+  } else if (primary == 2){
+    if (!is.na(subtypes[i])){
+     if (!subtypes[i]==""){
+        if (subtypes[i]=='A'){
+          t_primary = 139
+        } else if (subtypes[i]=='C'){
+         t_primary = 183
+        } else if (subtypes[i]=='D'){
+          t_primary = 100
+        }
+      }
+    }
+  }
+
+  per_patient_VL[[i]]=per_patient_VL[[i]][days_VL>t_primary,]
+  per_patient_CD4[[i]]=per_patient_CD4[[i]][days_CD4>t_primary,]
+
+  # Determine if participant has enough data to use for analysis
+  per_patient_VL[[i]] <- per_patient_VL[[i]][!is.na(per_patient_VL[[i]]$VISIT),]
+  per_patient_CD4[[i]] <- per_patient_CD4[[i]][!is.na(per_patient_CD4[[i]]$VISIT),]
+
+  # are there still enough measurements?
+  if (dim(per_patient_CD4[[i]])[1]>0 && dim(per_patient_VL[[i]])[1]>0){
+    # Is first CD4 measurement within first year?
+    # are there at least 3 CD4 measurements?
+    if (length(per_patient_CD4[[i]]$CD4)>3){
+      # are the at least 180 days apart?
+      if ((per_patient_CD4[[i]]$Days[length(per_patient_CD4[[i]]$Days)]-per_patient_CD4[[i]]$Days[1])>180){
+        # are there at least 2 VL measures?
+        if (length(per_patient_VL[[i]])>2){
+          # is subype known?
+          if (subtypes[i] %in% c('A','C','D')){
+            suitable[i] = TRUE
+          }
+        }
+      }
+    }
+  }
+
+  i = i+1
+}
+
+
+#### Select only suitable participants
+IDs_suit = IDs[suitable]
+
+per_patient_CD4_suit = per_patient_CD4[suitable]
+per_patient_VL_suit = per_patient_VL[suitable]
+
+subtypes_suit = subtypes[suitable]
+country_suit = country[suitable]
+
+age_suit = age[suitable]
+```
+
+I then create a table that summarizes the data of the included the participants. 
+
+```{r summarize data included in the study, echo=FALSE}
+
+tot_par = length(IDs_suit)
+num_Uganda = sum(country_suit=='Uganda',na.rm = TRUE)
+num_Zimbabwe = sum(country_suit=='Zimbabwe', na.rm = TRUE)
+num_a = sum(subtypes_suit=='A', na.rm = TRUE)
+num_c = sum(subtypes_suit=='C', na.rm = TRUE)
+num_d = sum(subtypes_suit=='D', na.rm = TRUE)
+sub_Uganda_A = sum(subtypes_suit[country_suit=='Uganda']=='A',na.rm=TRUE)
+sub_Uganda_C = sum(subtypes_suit[country_suit=='Uganda']=='C',na.rm=TRUE)
+sub_Uganda_D = sum(subtypes_suit[country_suit=='Uganda']=='D',na.rm=TRUE)
+sub_Zimbabwe_A = sum(subtypes_suit[country_suit=='Zimbabwe']=='A',na.rm=TRUE)
+sub_Zimbabwe_C = sum(subtypes_suit[country_suit=='Zimbabwe']=='C',na.rm=TRUE)
+sub_Zimbabwe_D = sum(subtypes_suit[country_suit=='Zimbabwe']=='D',na.rm=TRUE)
+
+num_CD4 = rep(0, length(IDs_suit))
+num_spVL = rep(0, length(IDs_suit))
+
+for (i in seq(1,length(IDs_suit),1)){
+  num_CD4[i] = dim(per_patient_CD4_suit[[i]])[1]
+  num_spVL[i] = dim(per_patient_VL_suit[[i]])[1]
+}
+
+CD4_Uganda_A = median(num_CD4[country_suit=='Uganda'&subtypes_suit=='A'],na.rm=TRUE)
+CD4_Uganda_C = median(num_CD4[country_suit=='Uganda'&subtypes_suit=='C'],na.rm=TRUE)
+CD4_Uganda_D = median(num_CD4[country_suit=='Uganda'&subtypes_suit=='D'],na.rm=TRUE)
+CD4_Zimbabwe_A = median(num_CD4[country_suit=='Zimbabwe'&subtypes_suit=='A'],na.rm=TRUE)
+CD4_Zimbabwe_C = median(num_CD4[country_suit=='Zimbabwe'&subtypes_suit=='C'],na.rm=TRUE)
+CD4_Zimbabwe_D = median(num_CD4[country_suit=='Zimbabwe'&subtypes_suit=='D'],na.rm=TRUE)
+
+VL_Uganda_A = median(num_spVL[country_suit=='Uganda'&subtypes_suit=='A'],na.rm=TRUE)
+VL_Uganda_C = median(num_spVL[country_suit=='Uganda'&subtypes_suit=='C'],na.rm=TRUE)
+VL_Uganda_D = median(num_spVL[country_suit=='Uganda'&subtypes_suit=='D'],na.rm=TRUE)
+VL_Zimbabwe_A = median(num_spVL[country_suit=='Zimbabwe'&subtypes_suit=='A'],na.rm=TRUE)
+VL_Zimbabwe_C = median(num_spVL[country_suit=='Zimbabwe'&subtypes_suit=='C'],na.rm=TRUE)
+VL_Zimbabwe_D = median(num_spVL[country_suit=='Zimbabwe'&subtypes_suit=='D'],na.rm=TRUE)
+
+age_Uganda_A = median(age_suit[country_suit=='Uganda'&subtypes_suit=='A'],na.rm=TRUE)
+age_Uganda_C = median(age_suit[country_suit=='Uganda'&subtypes_suit=='C'],na.rm=TRUE)
+age_Uganda_D = median(age_suit[country_suit=='Uganda'&subtypes_suit=='D'],na.rm=TRUE)
+age_Zimbabwe_A = median(age_suit[country_suit=='Zimbabwe'&subtypes_suit=='A'],na.rm=TRUE)
+age_Zimbabwe_C = median(age_suit[country_suit=='Zimbabwe'&subtypes_suit=='C'],na.rm=TRUE)
+age_Zimbabwe_D = median(age_suit[country_suit=='Zimbabwe'&subtypes_suit=='D'],na.rm=TRUE)
+
+rows = c('total number of patients included', 'number of patients from Zimbabwe',
+         'number of patients from Uganda', 'number of patients with type A', 'number of patients with type C',
+         'number of patients with type D', 'number of patients in Zimbabwe with type A', 'number of patients in Zimbabwe with type C',
+         'number of patients in Zimbabwe with type D',  'number of patients in Uganda with type A',
+         'number of patients in Uganda with type C',  'number of patients in Uganda with type D')
+
+values = c(num_Uganda+num_Zimbabwe,num_Zimbabwe, num_Uganda, num_a+1, num_c,
+           num_d, sub_Zimbabwe_A, sub_Zimbabwe_C, sub_Zimbabwe_D, sub_Uganda_A, sub_Uganda_C, sub_Uganda_D)
+
+summary_data = matrix(values,nrow = length(rows))
+row.names(summary_data)<-rows
+
+summary_data
+
+```
+
+# Calculating setpoint viral load and decline of CD4 T cells 
+
+Based on the measurements per individual we calculate the setpoint viral load by taking the geometric mean of all included viral load measurements. 
+Also, I calculate the CD4 change by taking the slope of a linear fit through the data of each individual separately. To check that a linear fit through the data is the most suitable, I compare this fit with a:
+two-phase linear, 
+exponential,
+and power-law fit. 
+
+```{r calculate setpoint VL and CD4 decline, echo=FALSE}
+
+setpoint_VL = vector(mode = "numeric", length(IDs_suit)) # setpoint VL measure per patient
+CD4_decline = vector(mode = "numeric", length(IDs_suit)) # CD4 decline measure per patient
+
+num_measurements = vector(mode = "numeric", length(IDs_suit))
+CD4_int = vector(mode = "numeric", length(IDs_suit))
+CD4_first = vector(mode = "numeric", length(IDs_suit))
+CD4_first_time = vector(mode = "numeric", length(IDs_suit))
+span_CD4 = vector(mode = "numeric", length(IDs_suit))
+meas_CD4 = vector(mode = "numeric", length(IDs_suit))
+
+for (i in seq(1,length(IDs_suit),1)){
+  setpoint_VL[i] = geometric.mean(per_patient_VL_suit[[i]]$GCLPLAMA, na.rm = TRUE)
+  fit = lm(per_patient_CD4_suit[[i]]$CD4 ~ per_patient_CD4_suit[[i]]$Days)
+  CD4_decline[i] = fit$coefficients[[2]]
+  CD4_int[i] = fit$coefficients[[1]]
+  CD4_first[i]=per_patient_CD4_suit[[i]]$CD4[1]
+  CD4_first_time[i]=per_patient_CD4_suit[[i]]$Days[1]
+  span_CD4[i] = per_patient_CD4_suit[[i]]$Days[length(per_patient_CD4_suit[[i]]$Days)]-per_patient_CD4_suit[[i]]$Days[1]
+  meas_CD4[i] = length(per_patient_CD4_suit[[i]]$Days)
+}
+
+```
+
+Additionally, we do a mixed linear effect model to calculate the CD4 decline of each individual. 
+We also use that model to calculate the intercept of each individual. 
+
+```{r mixed effect model, echo=FALSE}
+library('lattice')
+## Estimate CD4 declines using lmer
+name_ID <- rep('', length(IDs_suit))
+
+for (i in seq(1,length(IDs_suit),1)){
+  if (i<10){
+    name_ID[i] <- paste('ID','00',i, sep='')
+  } else if (i<100){
+    name_ID[i] <- paste('ID','0',i, sep='')
+  } else if (i<1000){
+    name_ID[i] <- paste('ID',i, sep='')
+  }
+}
+
+CD4_all = c()
+Days_all = c()
+IDs_tot = c()
+subtypes_all = c()
+ages_all = c()
+country_all = c()
+spVL_all = c()
+init_all = c()
+VL_all = c()
+
+for (i in seq(1,length(IDs_suit),1)){
+  test = per_patient_CD4_suit[[i]]
+  CD4_all = c(CD4_all,test$CD4)
+  Days_all = c(Days_all,test$Days)
+  IDs_tot <- c(IDs_tot,rep(name_ID[i],length(test$CD4)))
+  subtypes_all <- c(subtypes_all,rep(subtypes_suit[i],length(test$CD4)))
+  ages_all <- c(ages_all,rep(age_suit[i],length(test$CD4)))
+  country_all <- c(country_all,rep(country_suit[i],length(test$CD4)))
+  spVL_all <- c(spVL_all,rep(setpoint_VL[i],length(test$CD4)))
+  init_all <- c(init_all, rep(CD4_first[i], length(test$CD4)))
+  VL_all <- c(VL_all, per_patient_VL_suit[[i]]$GCLPLAMA )
+}
+
+Days_all_rescale <- scale(Days_all, center=FALSE)
+
+# basic linear model
+lmm_fit_CD4 <- lmer(CD4_all~Days_all_rescale + (Days_all_rescale|IDs_tot), REML=FALSE)
+#summary(lmm_fit_CD4)
+#coef(lmm_fit_CD4)
+R_CD4 <-  1 - ( sum( (CD4_all-predict(lmm_fit_CD4))^2 ) )/(sum( (CD4_all-mean(CD4_all))^2 ))
+R_CD4
+
+```
+
+We test, by comparing 4 different models (linear, exponential, power-law, 2 phase linear fit) if a linear fit is indeed best to fit the CD4 T cell data. 
+
+```{r decide on individual model of decline, echo=FALSE}
+## compare fit to different kinds of model
+ni <- rep(0, length(IDs_suit))
+
+RSS_linear <- rep(0, length(IDs_suit))
+RSS_exponential <- rep(0, length(IDs_suit))
+RSS_power <- rep(0, length(IDs_suit))
+RSS_2phase <- rep(0, length(IDs_suit))
+
+for (i in seq(1,length(IDs_suit),1)){
+  test = per_patient_CD4_suit[[i]]
+  
+  # linear model 
+  linear_test <- lm(test$CD4 ~ test$Days )
+  RSS_linear[i] <- RSS(linear_test)
+  ni[i] <- dim(test)[1]
+
+  # two-phase linear model
+  # only perform if number of points is larger than ... otherwise use single linear fit
+  # check which break point is the most likely (use each data point as possibility)
+  intermediate.RSS <- rep(NA, length(2:(dim(test)[1]-1)))
+  
+  for (j in 2:(dim(test)[1]-1)){
+    # Fit first points 
+    fit1 <- lm( CD4~Days, data=test[1:j,] )
+    # time until which we use fit 1: 
+    t.dif <- (test$Days[j]+ test$Days[j+1])/2
+    int.dif <- fit1$coefficients[1]+ t.dif*fit1$coefficients[2]
+    # fit second linear model to rest of data
+    data.2 <- test[(j+1):dim(test)[1],]
+    Days.2 <- data.2$Days - t.dif
+    CD4.2 <- data.2$CD4 - int.dif
+    fit2 <- lm( CD4.2 ~ Days.2 + 0 )
+    
+    intermediate.RSS[j-1] <- RSS(fit1) + RSS(fit2)
+  }
+  
+  RSS_2phase[i] <- min(intermediate.RSS)
+  
+  # power law model
+  power_test <- lm(log10(test$CD4) ~ log10(test$Days))
+  RSS_power[i] <- sum((test$CD4 - 10^power_test$fitted.values)^2)
+  
+  # exponential model 
+  exponential_test <- lm(log10(test$CD4) ~ test$Days )
+  RSS_exponential[i] <- sum((test$CD4 - 10^exponential_test$fitted.values)^2)
+}
+
+#number of parameters per model + 1
+k_linear = 2 + 1
+k_power = 2 + 1
+k_exponential = 2 + 1
+k_2phase = 2+1+1+1 #two times a linear fit, once with intercept + the point where the fit breaks  
+
+# Calculate AICc value for each model over all individual data sets
+AIC_linear <- sum(ni* log(RSS_linear/ni) ) + 2*k_linear*length(IDs_suit)*(sum(ni))/(sum(ni)-k_linear*length(IDs_suit)-length(IDs_suit)) #46140.72
+AIC_power <- sum(ni* log(RSS_power/ni) ) + 2*k_power*length(IDs_suit)*(sum(ni))/(sum(ni)-k_power*length(IDs_suit)-length(IDs_suit)) #46902.91
+AIC_exponential <- sum(ni* log(RSS_exponential/ni) ) + 2*k_exponential*length(IDs_suit)*(sum(ni))/(sum(ni)-k_exponential*length(IDs_suit)-length(IDs_suit)) #46413.87
+AIC_2phase <- sum(ni* log(RSS_2phase/ni) ) + 2*k_2phase*length(IDs_suit)*(sum(ni))/(sum(ni)-k_2phase*length(IDs_suit)-length(IDs_suit)) #46712.27
+
+############################################################
+```
+
+Now, I create a file that contains all data of Figure 2, such that we can share this data. 
+
+```{r publish data, echo=FALSE}
+
+# Calculate rate of disease progression, the CD4 level 
+general_int = coef(lmm_fit_CD4)$IDs_tot[,1]
+general_int_raw = coef(lmm_fit_CD4)$IDs_tot[,1]
+general_slope = coef(lmm_fit_CD4)$IDs_tot[,2]/(max(Days_all)/max(Days_all_rescale)) * 365
+general_slope_raw = coef(lmm_fit_CD4)$IDs_tot[,2]
+CD4_int <- rep(0,length(IDs_suit))
+
+# correct for eliminating measures of the first 90 days of the measurements
+CD4_int[subtypes_suit=='A'] <- general_int[subtypes_suit=='A']  + 90/((max(Days_all)/max(Days_all_rescale)))*general_slope[subtypes_suit=='A']
+CD4_int[subtypes_suit=='C'] <- general_int[subtypes_suit=='C']  + 90/((max(Days_all)/max(Days_all_rescale)))*general_slope[subtypes_suit=='C']
+CD4_int[subtypes_suit=='D'] <- general_int[subtypes_suit=='D']  + 90/((max(Days_all)/max(Days_all_rescale)))*general_slope[subtypes_suit=='D']
+
+data_open = cbind( subtype = subtypes_suit, 
+                   countryOO = country_suit, 
+                   age = age_suit, 
+                   CD4_0 = CD4_int, 
+                   CD4_raw = coef(lmm_fit_CD4)$IDs_tot[,1],
+                   DCD4_perYear = general_slope, 
+                   DCD4_raw = general_slope_raw, 
+                   spVL = setpoint_VL)
+
+write.csv2( data_open , file = "/Users/jb22m516/OneDrive - Universitaet Bern/Project_B/DataSharing_PPV/data_open.csv" )
+
+```
